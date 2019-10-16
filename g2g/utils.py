@@ -478,7 +478,7 @@ def load_dataset(file_name):
     """
     if not file_name.endswith('.npz'):
         file_name += '.npz'
-    with np.load(file_name) as loader:
+    with np.load(file_name,allow_pickle=True) as loader:
         loader = dict(loader)
         A = sp.csr_matrix((loader['adj_data'], loader['adj_indices'],
                            loader['adj_indptr']), shape=loader['adj_shape'])

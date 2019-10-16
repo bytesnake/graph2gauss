@@ -109,14 +109,13 @@ class Graph2Gauss:
             self.neg_ind_energy = -self.energy_kl(self.ind_pairs)
 
     def __build(self):
-        w_init = tf.contrib.layers.xavier_initializer
+        w_init = tf.keras.initializers.GlorotNormal
 
         sizes = [self.D] + self.n_hidden
 
         for i in range(1, len(sizes)):
-            W = tf.get_variable(name='W{}'.format(i), shape=[sizes[i - 1], sizes[i]], dtype=tf.float32,
-                                initializer=w_init())
-            b = tf.get_variable(name='b{}'.format(i), shape=[sizes[i]], dtype=tf.float32, initializer=w_init())
+            W = tf.Variable(shape=[size[i-1]], dtype=tf.float32, init_values = w_init())
+            b = tf.Variable(shape=[size[i]], dtype=tf.float32, init_values = w_init())
 
             if i == 1:
                 encoded = tf.sparse_tensor_dense_matmul(self.X, W) + b
@@ -125,12 +124,13 @@ class Graph2Gauss:
 
             encoded = tf.nn.relu(encoded)
 
-        W_mu = tf.get_variable(name='W_mu', shape=[sizes[-1], self.L], dtype=tf.float32, initializer=w_init())
-        b_mu = tf.get_variable(name='b_mu', shape=[self.L], dtype=tf.float32, initializer=w_init())
+        W_mu = tf.Variable(shape=[size[-1]], dtype=tf.float32, init_values = w_init())
+        b_mu = tf.Variable(shape=[size[self.L]], dtype=tf.float32, init_values = w_init())
         self.mu = tf.matmul(encoded, W_mu) + b_mu
 
-        W_sigma = tf.get_variable(name='W_sigma', shape=[sizes[-1], self.L], dtype=tf.float32, initializer=w_init())
-        b_sigma = tf.get_variable(name='b_sigma', shape=[self.L], dtype=tf.float32, initializer=w_init())
+        W_sigma = tf.Variable(shape=[size[i-1]], dtype=tf.float32, init_values = w_init())
+        b_sigma = tf.Variable(shape=[size[i]], dtype=tf.float32, init_values = w_init())
+
         log_sigma = tf.matmul(encoded, W_sigma) + b_sigma
         self.sigma = tf.nn.elu(log_sigma) + 1 + 1e-14
 
