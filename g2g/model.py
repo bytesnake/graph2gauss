@@ -2,7 +2,6 @@ import numpy as np
 import tensorflow as tf
 from .utils import *
 
-
 class Graph2Gauss:
     """
     Implementation of the method proposed in the paper:
@@ -110,6 +109,8 @@ class Graph2Gauss:
 
     def __build(self):
         w_init = tf.keras.initializers.GlorotNormal
+
+        layers = [tf.keras.layers.Dense(hidden_size, activation=tf.nn.relu) for size in [self.D] + self.n_hidden]
 
         sizes = [self.D] + self.n_hidden
 
@@ -269,7 +270,7 @@ class Graph2Gauss:
         sess.run(tf.global_variables_initializer())
 
         for epoch in range(self.max_iter):
-            loss, _ = sess.run([self.loss, train_op], self.feed_dict)
+            #loss, _ = sess.run([self.loss, train_op], self.feed_dict)
 
             if self.val_early_stopping:
                 val_auc, val_ap = score_link_prediction(self.val_ground_truth, sess.run(self.neg_val_energy, self.feed_dict))
