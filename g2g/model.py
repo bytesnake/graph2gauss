@@ -13,7 +13,7 @@ class Graph2Gauss:
     Aleksandar Bojchevski
     Technical University of Munich
     """
-    def __init__(self, A, X, L, K=1, p_val=0.10, p_test=0.05, p_nodes=0.0, n_hidden=None,
+    def __init__(self, A, X, L, K=1, p_val=0.10, p_test=0.05, p_nodes=0.0, hidden_layer=[512],
                  max_iter=2000, tolerance=100, scale=False, seed=0, verbose=True):
         """
         Parameters
@@ -32,7 +32,7 @@ class Graph2Gauss:
             Percent of edges in the test set, 0 <= p_test < 1
         p_nodes : float
             Percent of nodes to hide (inductive learning), 0 <= p_nodes < 1
-        n_hidden : list(int)
+        hidden_layers : list(int)
             A list specifying the size of each hidden layer, default n_hidden=[512]
         max_iter :  int
             Maximum number of epoch for which to run gradient descent
@@ -45,10 +45,10 @@ class Graph2Gauss:
         verbose : bool
             Verbosity.
         """
-        tf.reset_default_graph()
-        tf.set_random_seed(seed)
+        tf.random.set_seed(seed)
         np.random.seed(seed)
 
+        # ensure that the attribute matrix constists of f32
         X = X.astype(np.float32)
 
         # completely hide some nodes from the network for inductive evaluation
@@ -64,10 +64,6 @@ class Graph2Gauss:
         self.tolerance = tolerance
         self.scale = scale
         self.verbose = verbose
-
-        if n_hidden is None:
-            n_hidden = [512]
-        self.n_hidden = n_hidden
 
         # hold out some validation and/or test edges
         # pre-compute the hops for each node for more efficient sampling
@@ -108,38 +104,15 @@ class Graph2Gauss:
             self.neg_ind_energy = -self.energy_kl(self.ind_pairs)
 
     def __build(self):
-        w_init = tf.keras.initializers.GlorotNormal
+        from tf.keras.layers import Dense
 
-        layers = [tf.keras.layers.Dense(hidden_size, activation=tf.nn.relu) for size in [self.D] + self.n_hidden]
+        layers = [Dense(hidden_size, activation=tf.nn.relu) for size in [self.D] + self.hidden_layers]
+        self.mu = Dense(self.L, activation=None)
+        self.sigma = Dense(self.L, activation=tf.nn.elu) + 1 + 1e-14
 
-        sizes = [self.D] + self.n_hidden
-
-        for i in range(1, len(sizes)):
-            W = tf.Variable(shape=[size[i-1]], dtype=tf.float32, init_values = w_init())
-            b = tf.Variable(shape=[size[i]], dtype=tf.float32, init_values = w_init())
-
-            if i == 1:
-                encoded = tf.sparse_tensor_dense_matmul(self.X, W) + b
-            else:
-                encoded = tf.matmul(encoded, W) + b
-
-            encoded = tf.nn.relu(encoded)
-
-        W_mu = tf.Variable(shape=[size[-1]], dtype=tf.float32, init_values = w_init())
-        b_mu = tf.Variable(shape=[size[self.L]], dtype=tf.float32, init_values = w_init())
-        self.mu = tf.matmul(encoded, W_mu) + b_mu
-
-        W_sigma = tf.Variable(shape=[size[i-1]], dtype=tf.float32, init_values = w_init())
-        b_sigma = tf.Variable(shape=[size[i]], dtype=tf.float32, init_values = w_init())
-
-        log_sigma = tf.matmul(encoded, W_sigma) + b_sigma
-        self.sigma = tf.nn.elu(log_sigma) + 1 + 1e-14
-
-    def __build_loss(self):
-        hop_pos = tf.stack([self.triplets[:, 0], self.triplets[:, 1]], 1)
-        hop_neg = tf.stack([self.triplets[:, 0], self.triplets[:, 2]], 1)
-        eng_pos = self.energy_kl(hop_pos)
-        eng_neg = self.energy_kl(hop_neg)
+    def custom_loss(xPos, xNeg):
+        eng_pos = self.energy_kl(xPos)
+        eng_neg = self.energy_kl(xNeg)
         energy = tf.square(eng_pos) + tf.exp(-eng_neg)
 
         if self.scale:
@@ -260,43 +233,51 @@ class Graph2Gauss:
             Tensorflow session that can be used to obtain the trained embeddings
 
         """
-        early_stopping_score_max = -float('inf')
-        tolerance = self.tolerance
+        hop_pos = tf.stack([self.triplets[:, 0], self.triplets[:, 1]], 1)
+        hop_neg = tf.stack([self.triplets[:, 0], self.triplets[:, 2]], 1)
 
-        train_op = tf.train.AdamOptimizer(learning_rate=1e-3).minimize(self.loss)
+        self.loss.compile(loss=custom_loss, optimizer='adam', metrics=['accuracy'])
+        es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=self.tolerance)
+        mc = ModelCheckpoint('best_model.h5', monitor='val_accuracy', mode='max', verbose=1, save_best_only=True)
+        history = model.fit(hop_pos, hop_neg, epochs=4000, verbose=0, callbacks=[es, mc])
 
-        sess = tf.Session(config=tf.ConfigProto(gpu_options=tf.GPUOptions(visible_device_list=gpu_list,
-                                                                          allow_growth=True)))
-        sess.run(tf.global_variables_initializer())
+        #early_stopping_score_max = -float('inf')
+        #tolerance = self.tolerance
 
-        for epoch in range(self.max_iter):
-            #loss, _ = sess.run([self.loss, train_op], self.feed_dict)
+        #train_op = tf.train.AdamOptimizer(learning_rate=1e-3).minimize(self.loss)
 
-            if self.val_early_stopping:
-                val_auc, val_ap = score_link_prediction(self.val_ground_truth, sess.run(self.neg_val_energy, self.feed_dict))
-                early_stopping_score = val_auc + val_ap
+        #sess = tf.Session(config=tf.ConfigProto(gpu_options=tf.GPUOptions(visible_device_list=gpu_list,
+        #                                                                  allow_growth=True)))
+        #sess.run(tf.global_variables_initializer())
 
-                if self.verbose and epoch % 50 == 0:
-                    print('epoch: {:3d}, loss: {:.4f}, val_auc: {:.4f}, val_ap: {:.4f}'.format(epoch, loss, val_auc, val_ap))
+        #for epoch in range(self.max_iter):
+        #    #loss, _ = sess.run([self.loss, train_op], self.feed_dict)
 
-            else:
-                early_stopping_score = -loss
-                if self.verbose and epoch % 50 == 0:
-                    print('epoch: {:3d}, loss: {:.4f}'.format(epoch, loss))
+        #    if self.val_early_stopping:
+        #        val_auc, val_ap = score_link_prediction(self.val_ground_truth, sess.run(self.neg_val_energy, self.feed_dict))
+        #        early_stopping_score = val_auc + val_ap
 
-            if early_stopping_score > early_stopping_score_max:
-                early_stopping_score_max = early_stopping_score
-                tolerance = self.tolerance
-                self.__save_vars(sess)
-            else:
-                tolerance -= 1
+        #        if self.verbose and epoch % 50 == 0:
+        #            print('epoch: {:3d}, loss: {:.4f}, val_auc: {:.4f}, val_ap: {:.4f}'.format(epoch, loss, val_auc, val_ap))
 
-            if tolerance == 0:
-                break
-        
-        if tolerance > 0:
-            print('WARNING: Training might not have converged. Try increasing max_iter') 
+        #    else:
+        #        early_stopping_score = -loss
+        #        if self.verbose and epoch % 50 == 0:
+        #            print('epoch: {:3d}, loss: {:.4f}'.format(epoch, loss))
+
+        #    if early_stopping_score > early_stopping_score_max:
+        #        early_stopping_score_max = early_stopping_score
+        #        tolerance = self.tolerance
+        #        self.__save_vars(sess)
+        #    else:
+        #        tolerance -= 1
+#
+#       #     if tolerance == 0:
+        #        break
+        #
+        #if tolerance > 0:
+        #    print('WARNING: Training might not have converged. Try increasing max_iter') 
                   
-        self.__restore_vars(sess)
+        #self.__restore_vars(sess)
 
-        return sess
+        #return sess
