@@ -242,7 +242,7 @@ class Graph2Gauss:
         #print(mean_vars)
 
         y_pred = -self.loss.energy_kl(y_pred)
-        fpr, tpr, threshold = roc_curve(y_truth, y_preds)
+        fpr, tpr, threshold = roc_curve(y_truth, y_pred)
         roc_auc = roc_auc_score(y_truth, y_pred)
         
         plt.title('Receiver Operating Characteristic')
@@ -254,5 +254,3 @@ class Graph2Gauss:
         plt.ylabel('True Positive Rate')
         plt.xlabel('False Positive Rate')
         plt.show()
-
-    
