@@ -108,6 +108,7 @@ class RocCallback(keras.callbacks.Callback):
         self.loss = loss
         self.x_input = X[X_access]
         self.y_truth = np.concatenate((np.ones(ones.shape[0]), np.zeros(zeros.shape[0])))
+        self.last_val = 0.0
 
     def on_train_begin(self, logs={}):
         return
@@ -120,12 +121,26 @@ class RocCallback(keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch, logs={}):
         y_pred = self.model.predict(self.x_input)
-        mean_vars = np.mean(y_pred[:,0,1],axis=0)
-        print(mean_vars)
+        #mean_vars = np.mean(y_pred[:,0,1],axis=0)
+        #print(mean_vars)
 
         y_pred = -self.loss.energy_kl(y_pred)
         auc, prec = roc_auc_score(self.y_truth, y_pred), average_precision_score(self.y_truth, y_pred)
-        print('\nROC auc: {} - ROC precision: {}'.format(auc, prec))
+
+        if auc > self.last_val:
+            self.last_val = auc
+            self.tolerance = 50
+            self.model.save_weights('model.h5')
+        else:
+            self.tolerance -= 1
+
+        print(' ROC auc: {} - ROC precision: {}'.format(auc, prec))
+
+        if self.tolerance == 0:
+            self.model.load_weights('model.h5')
+            self.model.stop_training = True
+            print("ROC auc has not increased for 50 epoch! Stopping ..")
+
         return
 
     def on_batch_begin(self, batch, logs={}):
@@ -229,8 +244,6 @@ class Graph2Gauss:
         """
 
         self.model.compile(loss=self.loss.custom_loss, optimizer='adam', metrics=[])
-        #es = keras.callbacks.EarlyStopping(monitor='pred', mode='min', verbose=1, patience=self.tolerance)
-        #mc = keras.callbacks.ModelCheckpoint('best_model.h5', monitor='pred', mode='min', verbose=1, save_best_only=True)
         history = self.model.fit_generator(self.training_generator, epochs=self.max_iter, callbacks=[self.roc])
 
     def test(self):
@@ -254,3 +267,7 @@ class Graph2Gauss:
         plt.ylabel('True Positive Rate')
         plt.xlabel('False Positive Rate')
         plt.show()
+
+    def save(self, out):
+        self.model.summary()
+        saved_model_path = tf.keras.models.save_model(self.model, out)
