@@ -2,8 +2,8 @@ import math
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-from sklearn.metrics import roc_auc_score, average_precision_score
-from memory_profiler import profile
+from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
+import matplotlib.pyplot as plt
 
 from .utils import *
 
@@ -118,7 +118,6 @@ class RocCallback(keras.callbacks.Callback):
     def on_epoch_begin(self, epoch, logs={}):
         return
 
-    @profile(precision=4)
     def on_epoch_end(self, epoch, logs={}):
         y_pred = self.model.predict(self.x_input)
         mean_vars = np.mean(y_pred[:,0,1],axis=0)
@@ -203,12 +202,13 @@ class Graph2Gauss:
         # hold out some validation and/or test edges
         # pre-compute the hops for each node for more efficient sampling
         if p_val + p_test > 0:
-            train_ones, val_ones, val_zeros, test_ones, test_zeros = train_val_test_split_adjacency(
+            train_ones, val_ones, val_zeros, self.test_ones, self.test_zeros = train_val_test_split_adjacency(
                 A=A, p_val=p_val, p_test=p_test, seed=seed, neg_mul=1, every_node=True, connected=False,
                 undirected=(A != A.T).nnz == 0)
             
             self.training_generator = TrainingSequence(self.X, train_ones, K, 128)
             self.roc = RocCallback(self.X, val_ones, val_zeros, self.model, self.loss)
+
         else:
             pass
 
@@ -232,4 +232,27 @@ class Graph2Gauss:
         #es = keras.callbacks.EarlyStopping(monitor='pred', mode='min', verbose=1, patience=self.tolerance)
         #mc = keras.callbacks.ModelCheckpoint('best_model.h5', monitor='pred', mode='min', verbose=1, save_best_only=True)
         history = self.model.fit_generator(self.training_generator, epochs=self.max_iter, callbacks=[self.roc])
+
+    def test(self):
+        X_access = np.concatenate((self.test_ones, self.test_zeros), axis=0)
+        y_truth = np.concatenate((np.ones(self.test_ones.shape[0]), np.zeros(self.test_zeros.shape[0])))
+
+        y_pred = self.model.predict(self.X[X_access])
+        #mean_vars = np.mean(y_pred[:,0,1],axis=0)
+        #print(mean_vars)
+
+        y_pred = -self.loss.energy_kl(y_pred)
+        fpr, tpr, threshold = roc_curve(y_truth, y_preds)
+        roc_auc = roc_auc_score(y_truth, y_pred)
+        
+        plt.title('Receiver Operating Characteristic')
+        plt.plot(fpr, tpr, 'b', label = 'AUC = %0.2f' % roc_auc)
+        plt.legend(loc = 'lower right')
+        plt.plot([0, 1], [0, 1],'r--')
+        plt.xlim([0, 1])
+        plt.ylim([0, 1])
+        plt.ylabel('True Positive Rate')
+        plt.xlabel('False Positive Rate')
+        plt.show()
+
     
