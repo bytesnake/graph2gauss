@@ -1,6 +1,142 @@
+import math
 import numpy as np
 import tensorflow as tf
+from tensorflow import keras
+from sklearn.metrics import roc_auc_score, average_precision_score
+from memory_profiler import profile
+
 from .utils import *
+
+class Model(keras.models.Model):
+    def __init__(self, layer_sizes):
+        from tensorflow.keras.layers import Dense, Input, Lambda
+        super(Model, self).__init__()
+
+        input_layer = Input(shape=(1,layer_sizes[0],))
+
+        layer = input_layer
+        for size in layer_sizes[1:-1]:
+            layer = Dense(size, activation=tf.nn.relu)(layer)
+
+        mu = Dense(layer_sizes[-1], activation=None)(layer)
+        
+        layer = Dense(layer_sizes[-1], activation=tf.nn.elu)(layer)
+        sigma = Lambda(lambda x: x + 1 + 1e-14)(layer)
+
+        conc = tf.stack([mu, sigma], 2)
+
+        self.model = keras.Model(inputs=input_layer, outputs=conc)
+
+    def call(self, input_data):
+        return self.model.call(input_data)
+
+class TrainingSequence(keras.utils.Sequence):
+    def __init__(self,X, ones, K, batch_size):
+        self.X = X
+        self.batch_size = batch_size
+
+        A_train = edges_to_sparse(ones, self.X.shape[0])
+        self.hops = get_hops(A_train, K)
+
+        self.scale_terms = {h if h != -1 else max(self.hops.keys()) + 1:
+                           self.hops[h].sum(1).A1 if h != -1 else self.hops[1].shape[0] - self.hops[h].sum(1).A1
+                       for h in self.hops}
+
+        self.on_epoch_end()
+
+    def on_epoch_end(self):
+        self.items, self.weights = to_triplets(sample_all_hops(self.hops), self.scale_terms)
+        self.size = self.items.shape[0]
+
+    def __getitem__(self, i):
+        X_training = self.X[self.items[self.batch_size*i:self.batch_size*(i+1)]]
+        weights_training = self.weights[self.batch_size*i:self.batch_size*(i+1)]
+
+        return X_training, weights_training
+
+    def __len__(self):
+        return math.floor(self.size / self.batch_size)
+
+class LossFunction:
+    def __init__(self, L, scale=False):
+        self.L = L
+        self.scale = scale
+
+    def custom_loss(self, scale_terms, params):
+        pos = tf.stack([params[:,0], params[:,1]],1)
+        neg = tf.stack([params[:,0], params[:,2]],1)
+
+        eng_pos = self.energy_kl(pos)
+        eng_neg = self.energy_kl(neg)
+        energy = tf.square(eng_pos) + tf.exp(-eng_neg)
+
+        if self.scale:
+            return tf.reduce_mean(energy * scale_terms)
+        else:
+            return tf.reduce_mean(energy)
+
+    def energy_kl(self, data):
+        """
+        Computes the energy of a set of node pairs as the KL divergence between their respective Gaussian embeddings.
+
+        Parameters
+        ----------
+        pairs : array-like, shape [?, 2]
+            The edges/non-edges for which the energy is calculated
+
+        Returns
+        -------
+        energy : array-like, shape [?]
+            The energy of each pair given the currently learned model
+        """
+        
+        #print(data.shape)
+        sigma_ratio = data[:, 0, 1] / data[:, 1, 1]
+
+        trace_fac = tf.reduce_sum(sigma_ratio, 1)
+        log_det = tf.reduce_sum(tf.math.log(sigma_ratio + 1e-14), 1)
+
+        mu_diff_sq = tf.reduce_sum(tf.square(data[:, 0, 0] - data[:, 1, 0]) / data[:, 0, 1], 1)
+
+        return 0.5 * (trace_fac + mu_diff_sq - self.L - log_det)
+
+class RocCallback(keras.callbacks.Callback):
+    def __init__(self, X, ones, zeros, model,loss):
+        X_access = np.concatenate((ones, zeros), axis=0)
+
+        self.model = model
+        self.loss = loss
+        self.x_input = X[X_access]
+        self.y_truth = np.concatenate((np.ones(ones.shape[0]), np.zeros(zeros.shape[0])))
+
+    def on_train_begin(self, logs={}):
+        return
+
+    def on_train_end(self, logs={}):
+        return
+
+    def on_epoch_begin(self, epoch, logs={}):
+        return
+
+    @profile(precision=4)
+    def on_epoch_end(self, epoch, logs={}):
+        y_pred = self.model.predict(self.x_input)
+        mean_vars = np.mean(y_pred[:,0,1],axis=0)
+        print(mean_vars)
+
+        y_pred = -self.loss.energy_kl(y_pred)
+        auc, prec = roc_auc_score(self.y_truth, y_pred), average_precision_score(self.y_truth, y_pred)
+        print('\nROC auc: {} - ROC precision: {}'.format(auc, prec))
+        return
+
+    def on_batch_begin(self, batch, logs={}):
+        return
+
+    def on_batch_end(self, batch, logs={}):
+        return
+
+    def get(self):
+        return (self.x_input, self.y_truth)
 
 class Graph2Gauss:
     """
@@ -13,7 +149,8 @@ class Graph2Gauss:
     Aleksandar Bojchevski
     Technical University of Munich
     """
-    def __init__(self, A, X, L, K=1, p_val=0.10, p_test=0.05, p_nodes=0.0, hidden_layer=[512],
+
+    def __init__(self, A, X, L, K=3, p_val=0.10, p_test=0.05, hidden_layers=[512],
                  max_iter=2000, tolerance=100, scale=False, seed=0, verbose=True):
         """
         Parameters
@@ -49,21 +186,19 @@ class Graph2Gauss:
         np.random.seed(seed)
 
         # ensure that the attribute matrix constists of f32
-        X = X.astype(np.float32)
+        #X = X.astype(np.float32)
 
-        # completely hide some nodes from the network for inductive evaluation
-        if p_nodes > 0:
-            A = self.__setup_inductive(A, X, p_nodes)
-        else:
-            self.X = tf.SparseTensor(*sparse_feeder(X))
-            self.feed_dict = None
+        self.X = X.toarray()
 
-        self.N, self.D = X.shape
-        self.L = L
+        self.N, D = X.shape
         self.max_iter = max_iter
         self.tolerance = tolerance
         self.scale = scale
         self.verbose = verbose
+
+        layer_sizes = [D] + hidden_layers + [L]
+        self.model = Model(layer_sizes)
+        self.loss = LossFunction(L, scale)
 
         # hold out some validation and/or test edges
         # pre-compute the hops for each node for more efficient sampling
@@ -71,152 +206,11 @@ class Graph2Gauss:
             train_ones, val_ones, val_zeros, test_ones, test_zeros = train_val_test_split_adjacency(
                 A=A, p_val=p_val, p_test=p_test, seed=seed, neg_mul=1, every_node=True, connected=False,
                 undirected=(A != A.T).nnz == 0)
-            A_train = edges_to_sparse(train_ones, self.N)
-            hops = get_hops(A_train, K)
+            
+            self.training_generator = TrainingSequence(self.X, train_ones, K, 128)
+            self.roc = RocCallback(self.X, val_ones, val_zeros, self.model, self.loss)
         else:
-            hops = get_hops(A, K)
-
-        scale_terms = {h if h != -1 else max(hops.keys()) + 1:
-                           hops[h].sum(1).A1 if h != -1 else hops[1].shape[0] - hops[h].sum(1).A1
-                       for h in hops}
-
-        self.__build()
-        self.__dataset_generator(hops, scale_terms)
-        self.__build_loss()
-
-        # setup the validation set for easy evaluation
-        if p_val > 0:
-            val_edges = np.row_stack((val_ones, val_zeros))
-            self.neg_val_energy = -self.energy_kl(val_edges)
-            self.val_ground_truth = A[val_edges[:, 0], val_edges[:, 1]].A1
-            self.val_early_stopping = True
-        else:
-            self.val_early_stopping = False
-
-        # setup the test set for easy evaluation
-        if p_test > 0:
-            test_edges = np.row_stack((test_ones, test_zeros))
-            self.neg_test_energy = -self.energy_kl(test_edges)
-            self.test_ground_truth = A[test_edges[:, 0], test_edges[:, 1]].A1
-
-        # setup the inductive test set for easy evaluation
-        if p_nodes > 0:
-            self.neg_ind_energy = -self.energy_kl(self.ind_pairs)
-
-    def __build(self):
-        from tf.keras.layers import Dense
-
-        layers = [Dense(hidden_size, activation=tf.nn.relu) for size in [self.D] + self.hidden_layers]
-        self.mu = Dense(self.L, activation=None)
-        self.sigma = Dense(self.L, activation=tf.nn.elu) + 1 + 1e-14
-
-    def custom_loss(xPos, xNeg):
-        eng_pos = self.energy_kl(xPos)
-        eng_neg = self.energy_kl(xNeg)
-        energy = tf.square(eng_pos) + tf.exp(-eng_neg)
-
-        if self.scale:
-            self.loss = tf.reduce_mean(energy * self.scale_terms)
-        else:
-            self.loss = tf.reduce_mean(energy)
-
-    def __setup_inductive(self, A, X, p_nodes):
-        N = A.shape[0]
-        nodes_rnd = np.random.permutation(N)
-        n_hide = int(N * p_nodes)
-        nodes_hide = nodes_rnd[:n_hide]
-
-        A_hidden = A.copy().tolil()
-        A_hidden[nodes_hide] = 0
-        A_hidden[:, nodes_hide] = 0
-
-        # additionally add any dangling nodes to the hidden ones since we can't learn from them
-        nodes_dangling = np.where(A_hidden.sum(0).A1 + A_hidden.sum(1).A1 == 0)[0]
-        if len(nodes_dangling) > 0:
-            nodes_hide = np.concatenate((nodes_hide, nodes_dangling))
-        nodes_keep = np.setdiff1d(np.arange(N), nodes_hide)
-
-        self.X = tf.sparse_placeholder(tf.float32)
-        self.feed_dict = {self.X: sparse_feeder(X[nodes_keep])}
-
-        self.ind_pairs = batch_pairs_sample(A, nodes_hide)
-        self.ind_ground_truth = A[self.ind_pairs[:, 0], self.ind_pairs[:, 1]].A1
-        self.ind_feed_dict = {self.X: sparse_feeder(X)}
-
-        A = A[nodes_keep][:, nodes_keep]
-
-        return A
-
-    def energy_kl(self, pairs):
-        """
-        Computes the energy of a set of node pairs as the KL divergence between their respective Gaussian embeddings.
-
-        Parameters
-        ----------
-        pairs : array-like, shape [?, 2]
-            The edges/non-edges for which the energy is calculated
-
-        Returns
-        -------
-        energy : array-like, shape [?]
-            The energy of each pair given the currently learned model
-        """
-        ij_mu = tf.gather(self.mu, pairs)
-        ij_sigma = tf.gather(self.sigma, pairs)
-
-        sigma_ratio = ij_sigma[:, 1] / ij_sigma[:, 0]
-        trace_fac = tf.reduce_sum(sigma_ratio, 1)
-        log_det = tf.reduce_sum(tf.log(sigma_ratio + 1e-14), 1)
-
-        mu_diff_sq = tf.reduce_sum(tf.square(ij_mu[:, 0] - ij_mu[:, 1]) / ij_sigma[:, 0], 1)
-
-        return 0.5 * (trace_fac + mu_diff_sq - self.L - log_det)
-
-    def __dataset_generator(self, hops, scale_terms):
-        """
-        Generates a set of triplets and associated scaling terms by:
-            1. Sampling for each node a set of nodes from each of its neighborhoods
-            2. Forming all implied pairwise constraints
-
-        Uses tf.Dataset API to perform the sampling in a separate thread for increased speed.
-
-        Parameters
-        ----------
-        hops : dict
-            A dictionary where each 1, 2, ... K, neighborhoods are saved as sparse matrices
-        scale_terms : dict
-            The appropriate up-scaling terms to ensure unbiased estimates for each neighbourhood
-        Returns
-        -------
-        """
-        def gen():
-            while True:
-                yield to_triplets(sample_all_hops(hops), scale_terms)
-
-        dataset = tf.data.Dataset.from_generator(gen, (tf.int32, tf.float32), ([None, 3], [None]))
-        self.triplets, self.scale_terms = dataset.prefetch(1).make_one_shot_iterator().get_next()
-
-    def __save_vars(self, sess):
-        """
-        Saves all the trainable variables in memory. Used for early stopping.
-
-        Parameters
-        ----------
-        sess : tf.Session
-            Tensorflow session used for training
-        """
-        self.saved_vars = {var.name: (var, sess.run(var)) for var in tf.trainable_variables()}
-
-    def __restore_vars(self, sess):
-        """
-        Restores all the trainable variables from memory. Used for early stopping.
-        Parameters
-        ----------
-        sess : tf.Session
-            Tensorflow session used for training
-        """
-        for name in self.saved_vars:
-                sess.run(tf.assign(self.saved_vars[name][0], self.saved_vars[name][1]))
+            pass
 
     def train(self, gpu_list='0'):
         """
@@ -233,51 +227,9 @@ class Graph2Gauss:
             Tensorflow session that can be used to obtain the trained embeddings
 
         """
-        hop_pos = tf.stack([self.triplets[:, 0], self.triplets[:, 1]], 1)
-        hop_neg = tf.stack([self.triplets[:, 0], self.triplets[:, 2]], 1)
 
-        self.loss.compile(loss=custom_loss, optimizer='adam', metrics=['accuracy'])
-        es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=self.tolerance)
-        mc = ModelCheckpoint('best_model.h5', monitor='val_accuracy', mode='max', verbose=1, save_best_only=True)
-        history = model.fit(hop_pos, hop_neg, epochs=4000, verbose=0, callbacks=[es, mc])
-
-        #early_stopping_score_max = -float('inf')
-        #tolerance = self.tolerance
-
-        #train_op = tf.train.AdamOptimizer(learning_rate=1e-3).minimize(self.loss)
-
-        #sess = tf.Session(config=tf.ConfigProto(gpu_options=tf.GPUOptions(visible_device_list=gpu_list,
-        #                                                                  allow_growth=True)))
-        #sess.run(tf.global_variables_initializer())
-
-        #for epoch in range(self.max_iter):
-        #    #loss, _ = sess.run([self.loss, train_op], self.feed_dict)
-
-        #    if self.val_early_stopping:
-        #        val_auc, val_ap = score_link_prediction(self.val_ground_truth, sess.run(self.neg_val_energy, self.feed_dict))
-        #        early_stopping_score = val_auc + val_ap
-
-        #        if self.verbose and epoch % 50 == 0:
-        #            print('epoch: {:3d}, loss: {:.4f}, val_auc: {:.4f}, val_ap: {:.4f}'.format(epoch, loss, val_auc, val_ap))
-
-        #    else:
-        #        early_stopping_score = -loss
-        #        if self.verbose and epoch % 50 == 0:
-        #            print('epoch: {:3d}, loss: {:.4f}'.format(epoch, loss))
-
-        #    if early_stopping_score > early_stopping_score_max:
-        #        early_stopping_score_max = early_stopping_score
-        #        tolerance = self.tolerance
-        #        self.__save_vars(sess)
-        #    else:
-        #        tolerance -= 1
-#
-#       #     if tolerance == 0:
-        #        break
-        #
-        #if tolerance > 0:
-        #    print('WARNING: Training might not have converged. Try increasing max_iter') 
-                  
-        #self.__restore_vars(sess)
-
-        #return sess
+        self.model.compile(loss=self.loss.custom_loss, optimizer='adam', metrics=[])
+        #es = keras.callbacks.EarlyStopping(monitor='pred', mode='min', verbose=1, patience=self.tolerance)
+        #mc = keras.callbacks.ModelCheckpoint('best_model.h5', monitor='pred', mode='min', verbose=1, save_best_only=True)
+        history = self.model.fit_generator(self.training_generator, epochs=self.max_iter, callbacks=[self.roc])
+    
