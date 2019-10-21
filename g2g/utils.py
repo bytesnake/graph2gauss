@@ -349,6 +349,7 @@ def get_hops(A, K):
     hops : dict
         A dictionary where each 1, 2, ... K, neighborhoods are saved as sparse matrices
     """
+    #import pdb; pdb.set_trace()
     hops = {1: A.tolil(), -1: A.tolil()}
     hops[1].setdiag(0)
 

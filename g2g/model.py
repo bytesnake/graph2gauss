@@ -1,34 +1,41 @@
+import os
 import math
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 import matplotlib.pyplot as plt
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Input, Lambda
 
 from .utils import *
 
-class Model(keras.models.Model):
-    def __init__(self, layer_sizes):
-        from tensorflow.keras.layers import Dense, Input, Lambda
-        super(Model, self).__init__()
+class MyLayer(keras.layers.Layer):
+    def __init__(self, L, **kwargs):
+        self.L = L
+        super(MyLayer, self).__init__(**kwargs)
 
-        input_layer = Input(shape=(1,layer_sizes[0],))
-
-        layer = input_layer
-        for size in layer_sizes[1:-1]:
-            layer = Dense(size, activation=tf.nn.relu)(layer)
-
-        mu = Dense(layer_sizes[-1], activation=None)(layer)
+    def build(self, input_shape):
+        self.mu = Dense(self.L, input_shape=input_shape, activation=None)
         
-        layer = Dense(layer_sizes[-1], activation=tf.nn.elu)(layer)
-        sigma = Lambda(lambda x: x + 1 + 1e-14)(layer)
+        self.sigma2 = Dense(self.L, input_shape=input_shape, activation=tf.nn.elu)
+        self.sigma = Lambda(lambda x: x + 1 + 1e-14)
 
-        conc = tf.stack([mu, sigma], 2)
+        super(MyLayer, self).build(input_shape)
 
-        self.model = keras.Model(inputs=input_layer, outputs=conc)
+    def call(self,x):
+        mu = self.mu(x)
+        sigma = self.sigma(self.sigma2(x))
 
-    def call(self, input_data):
-        return self.model.call(input_data)
+        return tf.concat([mu,sigma],2)
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], self.L)
+    
+    def get_config(self):
+        base_config = super(MyLayer, self).get_config()
+        base_config['L'] = self.L
+        return base_config
 
 class TrainingSequence(keras.utils.Sequence):
     def __init__(self,X, ones, K, batch_size):
@@ -90,13 +97,12 @@ class LossFunction:
             The energy of each pair given the currently learned model
         """
         
-        #print(data.shape)
-        sigma_ratio = data[:, 0, 1] / data[:, 1, 1]
+        sigma_ratio = data[:, 0, self.L:] / data[:, 1, self.L:]
 
         trace_fac = tf.reduce_sum(sigma_ratio, 1)
         log_det = tf.reduce_sum(tf.math.log(sigma_ratio + 1e-14), 1)
 
-        mu_diff_sq = tf.reduce_sum(tf.square(data[:, 0, 0] - data[:, 1, 0]) / data[:, 0, 1], 1)
+        mu_diff_sq = tf.reduce_sum(tf.square(data[:, 0, 0:self.L] - data[:, 1, 0:self.L]) / data[:, 0, self.L:], 1)
 
         return 0.5 * (trace_fac + mu_diff_sq - self.L - log_det)
 
@@ -164,8 +170,8 @@ class Graph2Gauss:
     Technical University of Munich
     """
 
-    def __init__(self, A, X, L, K=3, p_val=0.10, p_test=0.05, hidden_layers=[512],
-                 max_iter=2000, tolerance=100, scale=False, seed=0, verbose=True):
+    def __init__(self, A, X, L, K=1, p_val=0.002, p_test=0.001, hidden_layers=[512],
+                 max_iter=2000, tolerance=100, scale=False, seed=0, verbose=True, model_path=None):
         """
         Parameters
         ----------
@@ -202,7 +208,8 @@ class Graph2Gauss:
         # ensure that the attribute matrix constists of f32
         #X = X.astype(np.float32)
 
-        self.X = X.toarray()
+        #self.X = X.toarray()
+        self.X = X
 
         self.N, D = X.shape
         self.max_iter = max_iter
@@ -211,8 +218,21 @@ class Graph2Gauss:
         self.verbose = verbose
 
         layer_sizes = [D] + hidden_layers + [L]
-        self.model = Model(layer_sizes)
         self.loss = LossFunction(L, scale)
+
+
+        if model_path:
+            self.model = tf.keras.models.load_model(model_path, custom_objects={'MyLayer': MyLayer,'custom_loss': self.loss.custom_loss})
+        else:
+            self.model = Sequential()
+            self.model.add(Dense(layer_sizes[1], input_shape=(None, layer_sizes[0]), activation=tf.nn.relu))
+
+            for size in layer_sizes[2:-1]:
+                self.model.add(Dense(size, activation=tf.nn.relu))
+
+            self.model.add(MyLayer(layer_sizes[-1]))
+
+        self.model.compile(loss=self.loss.custom_loss, optimizer='adam', metrics=[])
 
         # hold out some validation and/or test edges
         # pre-compute the hops for each node for more efficient sampling
@@ -221,6 +241,8 @@ class Graph2Gauss:
                 A=A, p_val=p_val, p_test=p_test, seed=seed, neg_mul=1, every_node=True, connected=False,
                 undirected=(A != A.T).nnz == 0)
             
+            print("Generated {} training samples, {} validation samples, {} test samples".format(train_ones.shape[0], val_ones.shape[0] + val_zeros.shape[0], self.test_ones.shape[0] + self.test_zeros.shape[0]))
+
             self.training_generator = TrainingSequence(self.X, train_ones, K, 128)
             self.roc = RocCallback(self.X, val_ones, val_zeros, self.model, self.loss)
 
@@ -243,8 +265,8 @@ class Graph2Gauss:
 
         """
 
-        self.model.compile(loss=self.loss.custom_loss, optimizer='adam', metrics=[])
         history = self.model.fit_generator(self.training_generator, epochs=self.max_iter, callbacks=[self.roc])
+        self.model.summary()
 
     def test(self):
         X_access = np.concatenate((self.test_ones, self.test_zeros), axis=0)
@@ -257,7 +279,7 @@ class Graph2Gauss:
         y_pred = -self.loss.energy_kl(y_pred)
         fpr, tpr, threshold = roc_curve(y_truth, y_pred)
         roc_auc = roc_auc_score(y_truth, y_pred)
-        
+
         plt.title('Receiver Operating Characteristic')
         plt.plot(fpr, tpr, 'b', label = 'AUC = %0.2f' % roc_auc)
         plt.legend(loc = 'lower right')
@@ -269,5 +291,5 @@ class Graph2Gauss:
         plt.show()
 
     def save(self, out):
-        self.model.summary()
-        saved_model_path = tf.keras.models.save_model(self.model, out)
+        self.model.save(out, save_format="tf")
+        self.model.save(out + "/model.h5", save_format='h5')
