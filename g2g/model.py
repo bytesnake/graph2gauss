@@ -129,7 +129,6 @@ class RocCallback(keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch, logs={}):
         y_pred = self.model.predict(self.x_input)
-        import pdb; pdb.set_trace()
         mean_vars = np.mean(y_pred[:,0,:],axis=0)
         self.variances.append(mean_vars)
 
@@ -278,8 +277,9 @@ class Graph2Gauss:
         y_truth = np.concatenate((np.ones(self.test_ones.shape[0]), np.zeros(self.test_zeros.shape[0])))
 
         y_pred = self.model.predict(self.X[X_access])
-        #mean_vars = np.mean(y_pred[:,0,1],axis=0)
-        #print(mean_vars)
+        import pdb; pdb.set_trace()
+        mean_vars = np.mean(y_pred[:,0,1],axis=0)
+        print(mean_vars)
 
         y_pred = -self.loss.energy_kl(y_pred)
         fpr, tpr, threshold = roc_curve(y_truth, y_pred)
