@@ -116,6 +116,8 @@ class RocCallback(keras.callbacks.Callback):
         self.y_truth = np.concatenate((np.ones(ones.shape[0]), np.zeros(zeros.shape[0])))
         self.last_val = 0.0
 
+        self.variances = []
+
     def on_train_begin(self, logs={}):
         return
 
@@ -127,15 +129,18 @@ class RocCallback(keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch, logs={}):
         y_pred = self.model.predict(self.x_input)
-        #mean_vars = np.mean(y_pred[:,0,1],axis=0)
-        #print(mean_vars)
+        import pdb; pdb.set_trace()
+        mean_vars = np.mean(y_pred[:,0,:],axis=0)
+        self.variances.append(mean_vars)
+
+        np.save("variances.npy", self.variances);
 
         y_pred = -self.loss.energy_kl(y_pred)
         auc, prec = roc_auc_score(self.y_truth, y_pred), average_precision_score(self.y_truth, y_pred)
 
         if auc > self.last_val:
             self.last_val = auc
-            self.tolerance = 50
+            self.tolerance = 500
             self.model.save_weights('model.h5')
         else:
             self.tolerance -= 1
