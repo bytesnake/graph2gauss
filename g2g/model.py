@@ -272,6 +272,9 @@ class Graph2Gauss:
         history = self.model.fit_generator(self.training_generator, epochs=self.max_iter, callbacks=[self.roc])
         self.model.summary()
 
+    def predict(self, X):
+        return self.model.predict(X)
+
     def test(self):
         X_access = np.concatenate((self.test_ones, self.test_zeros), axis=0)
         y_truth = np.concatenate((np.ones(self.test_ones.shape[0]), np.zeros(self.test_zeros.shape[0])))
